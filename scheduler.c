@@ -1,11 +1,13 @@
 #include "scheduler.h"
 #include "mavlink_tx.h"
+#include "mission.h"
 
 volatile uint32_t sys_tick = 0;
 
 static task_t tasks[] = {
     {send_heartbeat,          500,  0},
     {send_attitude,           100,  0},
+    {mission_update,          100,  0},
     {send_vfr_hud,            200,  0},
     {send_sys_status,        1000,  0},
     {send_gps_raw_int,       1000,  0},

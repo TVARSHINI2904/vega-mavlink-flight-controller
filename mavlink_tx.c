@@ -4,9 +4,9 @@
 
 uint8_t armed_state = 0;
 uint32_t custom_mode = 0;  /* 0=STABILIZE, 3=AUTO, 4=GUIDED, 5=LOITER, 6=RTL */
-static int32_t home_lat = 130827000;
-static int32_t home_lon = 802707000;
-static int32_t home_alt = 10000;
+int32_t home_lat = 130827000;
+int32_t home_lon = 802707000;
+int32_t home_alt = 10000;
 static float   home_x = 0.0f;
 static float   home_y = 0.0f;
 static float   home_z = 0.0f;
@@ -194,12 +194,9 @@ void send_vfr_hud(void)
 {
     mavlink_message_t msg;
 
-    sim_alt_mm += 500;
-    if (sim_alt_mm > 100000) sim_alt_mm = 0;
-
-    /* encode alt as IEEE754 float without FPU */
+    /* encode current simulated altitude as IEEE754 float without FPU */
     union { uint32_t u; float f; } alt_f;
-    uint32_t alt_m = (uint32_t)(sim_alt_mm / 1000);
+    uint32_t alt_m = (uint32_t)(current_alt_mm / 1000);
     /* simple LUT: 0..100m range */
     if      (alt_m == 0)   alt_f.u = 0x00000000;
     else if (alt_m < 5)    alt_f.u = 0x40800000;  /* ~4.0  */
@@ -211,12 +208,12 @@ void send_vfr_hud(void)
 
     mavlink_msg_vfr_hud_pack(
         1, 1, &msg,
-        15.0f,      /* airspeed */
-        14.5f,      /* groundspeed */
-        90,         /* heading */
-        50,         /* throttle */
-        alt_f.f,    /* alt */
-        0.5f        /* climb */
+        15.0f,                          /* airspeed */
+        14.5f,                          /* groundspeed */
+        current_heading,                /* heading */
+        50,                             /* throttle */
+        alt_f.f,                        /* alt */
+        0.5f                            /* climb */
     );
     mav_send_message(&msg);
 }
@@ -227,19 +224,19 @@ void send_gps_raw_int(void)
     mavlink_message_t msg;
     mavlink_msg_gps_raw_int_pack(
         1, 1, &msg,
-        0,           /* time_usec */
-        3,           /* fix_type: 3D fix */
-        130827000,   /* lat degE7 */
-        802707000,   /* lon degE7 */
-        10000,       /* alt mm */
-        100,         /* eph */
-        150,         /* epv */
-        1000,        /* vel cm/s */
-        9000,        /* cog 90.00 deg */
-        8,           /* satellites_visible */
-        0,           /* alt_ellipsoid */
-        0, 0, 0, 0,  /* h_acc, v_acc, vel_acc, hdg_acc */
-        0            /* yaw */
+        0,                         /* time_usec */
+        3,                         /* fix_type: 3D fix */
+        current_lat,               /* lat degE7 */
+        current_lon,               /* lon degE7 */
+        current_alt_mm,            /* alt mm */
+        100,                       /* eph */
+        150,                       /* epv */
+        1000,                      /* vel cm/s */
+        current_heading * 100,     /* cog 90.00 deg */
+        8,                         /* satellites_visible */
+        0,                         /* alt_ellipsoid */
+        0, 0, 0, 0,                /* h_acc, v_acc, vel_acc, hdg_acc */
+        current_heading            /* yaw */
     );
     mav_send_message(&msg);
 }
@@ -250,13 +247,13 @@ void send_global_position_int(void)
     mavlink_message_t msg;
     mavlink_msg_global_position_int_pack(
         1, 1, &msg,
-        0,          /* time_boot_ms */
-        130827000,  /* lat degE7 — Chennai */
-        802707000,  /* lon degE7 */
-        10000,      /* alt MSL mm */
-        10000,      /* relative alt mm */
-        0, 0, 0,    /* vx vy vz */
-        9000        /* hdg 90.00 deg */
+        0,                        /* time_boot_ms */
+        current_lat,              /* lat degE7 */
+        current_lon,              /* lon degE7 */
+        current_alt_mm,           /* alt MSL mm */
+        current_alt_mm,           /* relative alt mm */
+        0, 0, 0,                  /* vx vy vz */
+        current_heading * 100     /* hdg 90.00 deg */
     );
     mav_send_message(&msg);
 }
@@ -421,6 +418,90 @@ void send_mission_ack_to(uint8_t type, uint8_t target_sys, uint8_t target_comp)
         type,
         MAV_MISSION_TYPE_MISSION,
         0            /* opaque_id */
+    );
+    mav_send_message(&msg);
+}
+
+void send_mission_current(uint16_t seq)
+{
+    mavlink_message_t msg;
+    mavlink_msg_mission_current_pack(
+        1, 1, &msg,
+        seq,
+        mission_count,
+        0,  /* mission_state */
+        0,  /* mission_mode */
+        0,  /* mission_id */
+        0,  /* fence_id */
+        0   /* rally_points_id */
+    );
+    mav_send_message(&msg);
+}
+
+void send_mission_item_reached(uint16_t seq)
+{
+    mavlink_message_t msg;
+    mavlink_msg_mission_item_reached_pack(
+        1, 1, &msg,
+        seq
+    );
+    mav_send_message(&msg);
+}
+
+void send_mission_item_int_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp)
+{
+    if (seq >= mission_count)
+        return;
+
+    mavlink_message_t msg;
+    union { float f; uint32_t u; } alt;
+    alt.u = mission[seq].alt_raw;
+
+    mavlink_msg_mission_item_int_pack(
+        1, 1, &msg,
+        target_sys, target_comp,
+        seq,
+        MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        mission[seq].command,
+        (seq == current_waypoint_idx) ? 1 : 0,
+        1,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        mission[seq].lat,
+        mission[seq].lon,
+        alt.f,
+        MAV_MISSION_TYPE_MISSION
+    );
+    mav_send_message(&msg);
+}
+
+void send_mission_item_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp)
+{
+    if (seq >= mission_count)
+        return;
+
+    mavlink_message_t msg;
+    union { float f; uint32_t u; } alt;
+    alt.u = mission[seq].alt_raw;
+
+    mavlink_msg_mission_item_pack(
+        1, 1, &msg,
+        target_sys, target_comp,
+        seq,
+        MAV_FRAME_GLOBAL_RELATIVE_ALT,
+        mission[seq].command,
+        (seq == current_waypoint_idx) ? 1 : 0,
+        1,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        (float)mission[seq].lat / 10000000.0f,
+        (float)mission[seq].lon / 10000000.0f,
+        alt.f,
+        MAV_MISSION_TYPE_MISSION
     );
     mav_send_message(&msg);
 }

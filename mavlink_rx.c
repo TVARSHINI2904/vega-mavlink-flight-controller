@@ -199,6 +199,7 @@ static void handle_mission_count(const mavlink_message_t *msg)
     if (mission_count > MAX_WAYPOINTS)
         mission_count = MAX_WAYPOINTS;
 
+    mission_reset();
     send_statustext(MAV_SEVERITY_INFO, "MISSION_COUNT RXD");
 
     mission_rx_idx = 0;
@@ -230,6 +231,9 @@ static void handle_mission_item_int(const mavlink_message_t *msg)
     }
 
     mission_rx_idx++;
+    if (mission_rx_idx >= mission_count)
+        mission_loaded = 1;
+
     if (mission_rx_idx < mission_count)
         send_mission_request_int_to(mission_rx_idx, msg->sysid, msg->compid);
     else
@@ -254,6 +258,9 @@ static void handle_mission_item(const mavlink_message_t *msg)
     }
 
     mission_rx_idx++;
+    if (mission_rx_idx >= mission_count)
+        mission_loaded = 1;
+
     if (mission_rx_idx < mission_count)
         send_mission_request_int_to(mission_rx_idx, msg->sysid, msg->compid);
     else
@@ -270,13 +277,31 @@ static void handle_mission_request_list(const mavlink_message_t *msg)
         mavlink_message_t out;
         mavlink_msg_mission_count_pack(
             1, 1, &out,
-            req.target_system, req.target_component,
+            msg->sysid, msg->compid,
             mission_count,
             MAV_MISSION_TYPE_MISSION,
             0                    /* opaque_id */
         );
         mav_send_message(&out);
     }
+}
+
+static void handle_mission_request_int(const mavlink_message_t *msg)
+{
+    mavlink_mission_request_int_t req;
+
+    mavlink_msg_mission_request_int_decode(msg, &req);
+    if (req.target_system == 1 || req.target_system == 0)
+        send_mission_item_int_to(req.seq, msg->sysid, msg->compid);
+}
+
+static void handle_mission_request(const mavlink_message_t *msg)
+{
+    mavlink_mission_request_t req;
+
+    mavlink_msg_mission_request_decode(msg, &req);
+    if (req.target_system == 1 || req.target_system == 0)
+        send_mission_item_to(req.seq, msg->sysid, msg->compid);
 }
 
 /* poll UART and parse MAVLink v1/v2 */
@@ -325,6 +350,14 @@ void mavlink_rx_poll(void)
 
             case MAVLINK_MSG_ID_MISSION_ITEM:
                 handle_mission_item(&rx_msg);
+                break;
+
+            case MAVLINK_MSG_ID_MISSION_REQUEST:
+                handle_mission_request(&rx_msg);
+                break;
+
+            case MAVLINK_MSG_ID_MISSION_REQUEST_INT:
+                handle_mission_request_int(&rx_msg);
                 break;
 
             case MAVLINK_MSG_ID_MISSION_REQUEST_LIST:

@@ -39,5 +39,9 @@ void send_mission_request(uint16_t seq);
 void send_mission_request_to(uint16_t seq, uint8_t target_system, uint8_t target_component);
 void send_mission_ack(uint8_t type);
 void send_mission_ack_to(uint8_t type, uint8_t target_sys, uint8_t target_comp);
+void send_mission_current(uint16_t seq);
+void send_mission_item_reached(uint16_t seq);
+void send_mission_item_int_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp);
+void send_mission_item_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp);
 
 #endif
