@@ -2,6 +2,7 @@
 #include "mavlink_tx.h"
 #include "mission.h"
 #include "uart.h"
+#include "scheduler.h"
 
 static mavlink_message_t rx_msg;
 static mavlink_status_t  rx_status;
@@ -236,8 +237,10 @@ static void handle_mission_item_int(const mavlink_message_t *msg)
 
     if (mission_rx_idx < mission_count)
         send_mission_request_int_to(mission_rx_idx, msg->sysid, msg->compid);
-    else
+    else {
         send_mission_ack_to(MAV_MISSION_ACCEPTED, msg->sysid, msg->compid);
+        save_mission_to_nvm();   /* persist uploaded mission */
+    }
 }
 
 /* ── MISSION_ITEM (float lat/lon version) ── */
@@ -263,8 +266,49 @@ static void handle_mission_item(const mavlink_message_t *msg)
 
     if (mission_rx_idx < mission_count)
         send_mission_request_int_to(mission_rx_idx, msg->sysid, msg->compid);
-    else
+    else {
         send_mission_ack_to(MAV_MISSION_ACCEPTED, msg->sysid, msg->compid);
+        save_mission_to_nvm();   /* persist uploaded mission */
+    }
+}
+
+static void handle_set_position_target_global_int(const mavlink_message_t *msg)
+{
+    mavlink_set_position_target_global_int_t target;
+
+    mavlink_msg_set_position_target_global_int_decode(msg, &target);
+    if (!is_for_this_vehicle(target.target_system, target.target_component))
+        return;
+
+    /* only accept position targets in GUIDED mode */
+    if (custom_mode != 4)
+        return;
+
+    /* ignore if position bits (0-3) are masked out */
+    uint16_t mask = target.type_mask;
+    if (!(mask & 0x01) && !(mask & 0x02) && !(mask & 0x04)) {
+        guided_target_lat = target.lat_int;
+        guided_target_lon = target.lon_int;
+        guided_target_alt = (int32_t)(target.alt * 1000.0f); /* m → mm */
+        guided_target_set = 1;
+        send_statustext(MAV_SEVERITY_INFO, "GUIDED TARGET SET");
+    }
+}
+
+/* ── MISSION_CLEAR_ALL ── */
+static void handle_mission_clear_all(const mavlink_message_t *msg)
+{
+    mavlink_mission_clear_all_t clear;
+    mavlink_msg_mission_clear_all_decode(msg, &clear);
+
+    if (clear.target_system == 1 || clear.target_system == 0) {
+        mission_reset();
+        mission_count = 0;
+        mission_loaded = 0;
+        guided_target_set = 0;
+        send_mission_ack_to(MAV_MISSION_ACCEPTED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_INFO, "MISSION CLEARED");
+    }
 }
 
 /* ── MISSION_REQUEST_LIST ── */
@@ -362,6 +406,14 @@ void mavlink_rx_poll(void)
 
             case MAVLINK_MSG_ID_MISSION_REQUEST_LIST:
                 handle_mission_request_list(&rx_msg);
+                break;
+
+            case MAVLINK_MSG_ID_SET_POSITION_TARGET_GLOBAL_INT:
+                handle_set_position_target_global_int(&rx_msg);
+                break;
+
+            case MAVLINK_MSG_ID_MISSION_CLEAR_ALL:
+                handle_mission_clear_all(&rx_msg);
                 break;
 
             default:

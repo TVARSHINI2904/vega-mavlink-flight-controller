@@ -3,6 +3,7 @@
 #include "scheduler.h"
 #include "mavlink_tx.h"
 #include "mavlink_rx.h"
+#include "mission.h"
 
 /* ── timer ── */
 #define MTIME_BASE    0x0200BFF8UL
@@ -53,6 +54,10 @@ void timer_isr(void)
 void main(void)
 {
     MTIMECMP = MTIME + TICK_INTERVAL;
+
+    /* restore mission from non-volatile memory (if available) */
+    if (load_mission_from_nvm())
+        send_statustext(MAV_SEVERITY_INFO, "NVM RESTORED");
 
     while (1) {
         __asm__ volatile("wfi");

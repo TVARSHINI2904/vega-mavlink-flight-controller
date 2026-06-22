@@ -27,6 +27,7 @@ static param_entry_t params[] = {
     {"ARMING_CHECK", 0.0f, MAV_PARAM_TYPE_REAL32},
     {"FRAME_CLASS", 1.0f, MAV_PARAM_TYPE_REAL32},
     {"SERIAL0_BAUD", 115.0f, MAV_PARAM_TYPE_REAL32},
+    {"WP_RADIUS", 33.0f, MAV_PARAM_TYPE_REAL32},   /* waypoint acceptance radius (m) */
 };
 
 #define PARAM_COUNT ((uint16_t)(sizeof(params) / sizeof(params[0])))
@@ -144,7 +145,7 @@ void send_statustext(uint8_t severity, const char *text)
     mav_send_message(&msg);
 }
 
-/* ── SYS_STATUS ── */
+/* ── SYS_STATUS (uses dynamic battery from mission.c) ── */
 void send_sys_status(void)
 {
     mavlink_message_t msg;
@@ -152,13 +153,39 @@ void send_sys_status(void)
         1, 1, &msg,
         0x1F, 0x1F, 0x1F,  /* sensors present/enabled/health */
         300,                 /* load 30% */
-        12600,               /* voltage_battery mV */
-        150,                 /* current_battery 1.5A */
-        100,                 /* battery_remaining % */
+        battery_voltage_mv,  /* voltage_battery mV (dynamic) */
+        battery_current_ma,  /* current_battery mA (dynamic) */
+        battery_remaining_pct, /* battery_remaining % (dynamic) */
         0, 0, 0, 0, 0, 0,   /* drop_rate, errors x4 */
         0, 0, 0              /* extended sensor fields */
     );
     mav_send_message(&msg);
+}
+
+/* ── heading (deg) → radian float bits (no FPU) ── */
+/* lookup table: heading[deg] → radians as IEEE754 float bits */
+/* rad = deg * (π/180) */
+static uint32_t heading_deg_to_rad_bits(uint16_t heading_deg)
+{
+    /* correct radian values for each 45° increment */
+    /* 0°   = 0.0       rad = 0x00000000 */
+    /* 45°  = 0.785398  rad = 0x3F490FDB */
+    /* 90°  = 1.570796  rad = 0x3FC90FDB */
+    /* 135° = 2.356194  rad = 0x4016CBE4 */
+    /* 180° = 3.141593  rad = 0x40490FDB */
+    /* 225° = 3.926991  rad = 0x407B53F9 */
+    /* 270° = 4.712389  rad = 0x4096CBE4 */
+    /* 315° = 5.497787  rad = 0x40AFF581 */
+    /* 360° = 6.283185  rad = 0x40C90FDB */
+    if (heading_deg < 22)  return 0x00000000;  /* ~0°   → 0.0 rad */
+    if (heading_deg < 67)  return 0x3F490FDB;  /* ~45°  → 0.785 rad */
+    if (heading_deg < 112) return 0x3FC90FDB;  /* ~90°  → 1.571 rad */
+    if (heading_deg < 157) return 0x4016CBE4;  /* ~135° → 2.356 rad */
+    if (heading_deg < 202) return 0x40490FDB;  /* ~180° → 3.142 rad */
+    if (heading_deg < 247) return 0x407B53F9;  /* ~225° → 3.927 rad */
+    if (heading_deg < 292) return 0x4096CBE4;  /* ~270° → 4.712 rad */
+    if (heading_deg < 337) return 0x40AFF581;  /* ~315° → 5.498 rad */
+    return 0x40C90FDB;                          /* ~360° → 6.283 rad */
 }
 
 /* ── ATTITUDE ── */
@@ -172,18 +199,19 @@ void send_attitude(void)
     if (sim_roll_mrad > 800) sim_roll_mrad = -800;
 
     /* integer milliradians → IEEE754 float via union, no FPU */
-    union { float f; uint32_t u; } pitch, roll, zero, half;
+    union { float f; uint32_t u; } pitch, roll, zero;
+    union { float f; uint32_t u; } yaw;
     zero.u = 0x00000000;  /* 0.0f */
-    half.u = 0x3F000000;  /* 0.5f */
     roll.u  = (sim_roll_mrad  < 0) ? (0x80000000 | 0x3C23D70A) : 0x3C23D70A;
     pitch.u = (sim_pitch_mrad < 0) ? (0x80000000 | 0x3C23D70A) : 0x3C23D70A;
+    yaw.u = heading_deg_to_rad_bits(current_heading);
 
     mavlink_msg_attitude_pack(
         1, 1, &msg,
         0,          /* time_boot_ms */
         roll.f,     /* roll */
         pitch.f,    /* pitch */
-        zero.f,     /* yaw */
+        yaw.f,      /* yaw */
         zero.f, zero.f, zero.f
     );
     mav_send_message(&msg);
@@ -214,6 +242,40 @@ void send_vfr_hud(void)
         50,                             /* throttle */
         alt_f.f,                        /* alt */
         0.5f                            /* climb */
+    );
+    mav_send_message(&msg);
+}
+
+void send_battery_status(void)
+{
+    mavlink_message_t msg;
+    uint16_t voltages[10];
+    uint16_t voltages_ext[4] = {0, 0, 0, 0};
+    int16_t temperature = INT16_MAX;
+    int32_t current_consumed = -1;
+    int32_t energy_consumed = -1;
+    int8_t battery_remaining = (int8_t)battery_remaining_pct;
+
+    for (uint8_t i = 0; i < 10; i++)
+        voltages[i] = UINT16_MAX;
+    voltages[0] = battery_voltage_mv;
+
+    mavlink_msg_battery_status_pack(
+        1, 1, &msg,
+        0,                          /* battery id */
+        MAV_BATTERY_FUNCTION_ALL,   /* battery function */
+        MAV_BATTERY_TYPE_LIPO,      /* battery chemistry */
+        temperature,
+        voltages,
+        battery_current_ma,         /* current in cA */
+        current_consumed,
+        energy_consumed,
+        battery_remaining,
+        0,                          /* time_remaining */
+        0,                          /* charge_state */
+        voltages_ext,
+        0,                          /* mode */
+        0                           /* fault_bitmask */
     );
     mav_send_message(&msg);
 }
@@ -323,8 +385,18 @@ int16_t find_param_index(const char *param_id)
 
 void set_param_value(uint16_t index, float value)
 {
-    if (index < PARAM_COUNT)
-        params[index].value = value;
+    if (index >= PARAM_COUNT)
+        return;
+
+    params[index].value = value;
+
+    /* sync WP_RADIUS parameter to mission's wp_radius_m variable */
+    /* WP_RADIUS is at index 5 */
+    if (index == 5) {
+        wp_radius_m = (uint32_t)value;
+        if (wp_radius_m < 3) wp_radius_m = 3;
+        if (wp_radius_m > 500) wp_radius_m = 500;
+    }
 }
 
 /* ── PARAM_VALUE ── */
@@ -473,6 +545,86 @@ void send_mission_item_int_to(uint16_t seq, uint8_t target_sys, uint8_t target_c
         mission[seq].lon,
         alt.f,
         MAV_MISSION_TYPE_MISSION
+    );
+    mav_send_message(&msg);
+}
+
+/* ── integer distance → float bits (no FPU) ── */
+/* converts integer meters (0..10000) to IEEE754 float bits */
+static uint32_t int_to_float_bits(uint32_t val)
+{
+    /* LUT for integer → float bits for 0..100 with 5m resolution */
+    /* This covers all distances our simulated mission will produce */
+    if (val == 0)      return 0x00000000;  /* 0.0f   */
+    if (val <= 5)      return 0x40A00000;  /* 5.0f   */
+    if (val <= 10)     return 0x41200000;  /* 10.0f  */
+    if (val <= 20)     return 0x41A00000;  /* 20.0f  */
+    if (val <= 30)     return 0x41F00000;  /* 30.0f  */
+    if (val <= 50)     return 0x42480000;  /* 50.0f  */
+    if (val <= 75)     return 0x42960000;  /* 75.0f  */
+    if (val <= 100)    return 0x42C80000;  /* 100.0f */
+    if (val <= 150)    return 0x43160000;  /* 150.0f */
+    if (val <= 200)    return 0x43480000;  /* 200.0f */
+    if (val <= 300)    return 0x43960000;  /* 300.0f */
+    if (val <= 500)    return 0x43FA0000;  /* 500.0f */
+    if (val <= 1000)   return 0x447A0000;  /* 1000.0f*/
+    return 0x44FA0000;                     /* 2000.0f*/
+}
+
+/* ── NAV_CONTROLLER_OUTPUT ── */
+void send_nav_controller_output(void)
+{
+    mavlink_message_t msg;
+    union { float f; uint32_t u; } wp_dist;
+
+    /* compute distance to current waypoint (if mission active) */
+    uint32_t dist = 0;
+    if (mission_loaded && mission_count > 0 &&
+        current_waypoint_idx < mission_count &&
+        (custom_mode == 3 || custom_mode == 4)) {
+        int32_t dlat = mission[current_waypoint_idx].lat - current_lat;
+        int32_t dlon = mission[current_waypoint_idx].lon - current_lon;
+        /* approximate distance in meters */
+        /* degE7 → meters: 1e-7 deg * 111,319 m/deg ≈ 0.01113 m per unit */
+        /* use: dist_m = sqrt(dlat^2 + dlon^2) * 111319 / 10000000 */
+        uint32_t adlat = (dlat < 0) ? (uint32_t)(-dlat) : (uint32_t)dlat;
+        uint32_t adlon = (dlon < 0) ? (uint32_t)(-dlon) : (uint32_t)dlon;
+        /* pythagorean approx: max + 0.5*min */
+        uint32_t approx;
+        if (adlat >= adlon)
+            approx = adlat + (adlon / 2);
+        else
+            approx = adlon + (adlat / 2);
+        /* convert to meters: approx / 9 = meters (empirical factor from 111319/10000000) */
+        /* actually: approx * 111 / 1000 gives meters with reasonable accuracy */
+        dist = (approx * 111) / 1000;
+    }
+
+    /* convert integer distance to float bits */
+    wp_dist.u = int_to_float_bits(dist);
+
+    /* compute bearing to waypoint for target_bearing field */
+    int32_t dlat = 0;
+    int32_t dlon = 0;
+    uint16_t bearing = 0;
+    if (mission_loaded && mission_count > 0 &&
+        current_waypoint_idx < mission_count &&
+        (custom_mode == 3 || custom_mode == 4)) {
+        dlat = mission[current_waypoint_idx].lat - current_lat;
+        dlon = mission[current_waypoint_idx].lon - current_lon;
+        bearing = approx_heading_centideg(dlat, dlon) / 100;
+    }
+
+    mavlink_msg_nav_controller_output_pack(
+        1, 1, &msg,
+        0,                       /* nav_roll */
+        0,                       /* nav_pitch */
+        bearing,                 /* nav_bearing (target heading) */
+        bearing,                 /* target_bearing */
+        wp_dist.f,               /* wp_dist (float, meters) */
+        0,                       /* alt_error */
+        0,                       /* aspd_error */
+        current_heading          /* xtrack_error (reused for heading) */
     );
     mav_send_message(&msg);
 }

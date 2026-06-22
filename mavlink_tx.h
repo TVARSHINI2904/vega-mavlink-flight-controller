@@ -16,6 +16,7 @@ void send_heartbeat(void);
 void send_sys_status(void);
 void send_attitude(void);
 void send_vfr_hud(void);
+void send_battery_status(void);
 void send_gps_raw_int(void);
 void send_global_position_int(void);
 void send_home_position(void);
@@ -43,5 +44,6 @@ void send_mission_current(uint16_t seq);
 void send_mission_item_reached(uint16_t seq);
 void send_mission_item_int_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp);
 void send_mission_item_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp);
+void send_nav_controller_output(void);
 
 #endif
