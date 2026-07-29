@@ -29,11 +29,23 @@ void send_statustext(uint8_t severity, const char *text);
 void set_flight_mode(uint32_t mode);
 
 /* protocol responses */
+#define PARAM_WP_RADIUS 5
+#define PARAM_CMD_AUTH   6
+#define PARAM_MISSION_ID 7
+#define PARAM_MISSION_VER 8
+#define PARAM_MISSION_CHALLENGE 9
+#define PARAM_MISSION_CHAL_RESP 10
+
+/* session-specific command auth token (regenerated on each boot) */
+extern uint32_t current_cmd_auth_token;
+
 void send_command_ack(uint16_t command, uint8_t result);
 void send_param_value(uint16_t index);
 void send_all_params(void);
 int16_t find_param_index(const char *param_id);
 void set_param_value(uint16_t index, float value);
+uint8_t secure_command_allowed(void);
+float get_param_value(uint16_t index);
 void send_mission_request_int(uint16_t seq);
 void send_mission_request_int_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp);
 void send_mission_request(uint16_t seq);
@@ -45,5 +57,10 @@ void send_mission_item_reached(uint16_t seq);
 void send_mission_item_int_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp);
 void send_mission_item_to(uint16_t seq, uint8_t target_sys, uint8_t target_comp);
 void send_nav_controller_output(void);
+
+/* ── CMD_AUTH authentication timing ── */
+extern uint32_t auth_start_time;
+extern uint32_t auth_end_time;
+extern uint32_t auth_latency;
 
 #endif

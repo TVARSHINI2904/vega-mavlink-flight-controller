@@ -14,7 +14,7 @@ LDFLAGS    := $(ARCH) -nostartfiles -nostdlib -T link.ld -Wl,-Map=vega-fc-v2.map
 TARGET     := vega-fc-v2.elf
 BIN        := vega-fc-v2.bin
 
-SRC_C      := main.c uart.c scheduler.c mavlink_tx.c mavlink_rx.c mission.c
+SRC_C      := main.c uart.c scheduler.c scheduler_metrics.c mavlink_tx.c mavlink_rx.c mission.c
 SRC_ASM    := start.s
 OBJS       := $(SRC_C:.c=.o) $(SRC_ASM:.s=.o)
 

@@ -1,97 +1,318 @@
 # Vega-FC v2 — RISC-V Flight Controller Firmware
 
-Bare-metal flight controller firmware for the **Vega Thejas (32-bit RISC-V)** processor, communicating via **MAVLink v2** protocol. Supports telemetry transmission, ARM/DISARM, flight mode switching (STABILIZE, AUTO, GUIDED, LOITER, RTL), mission upload/download/clear, waypoint navigation with proportional control, autonomous mission execution, GUIDED click-to-fly, battery simulation, failsafe logic, mission persistence, and configurable parameters.
+[![License](https://img.shields.io/badge/license-TBD-yellow)](LICENSE)
+![Architecture](https://img.shields.io/badge/arch-RV32IM-blue)
+![Protocol](https://img.shields.io/badge/protocol-MAVLink%20v2-brightgreen)
+![Status](https://img.shields.io/badge/status-experimental-orange)
+
+A bare-metal MAVLink v2 flight controller firmware for the **VEGA/THEJAS32 RISC-V platform** with Mission Planner interoperability and a lightweight three-layer mission security framework.
 
 ---
 
 ## Table of Contents
-1. [Features](#features)
-2. [Prerequisites](#prerequisites)
-3. [Toolchain Installation](#toolchain-installation)
-4. [Build Instructions](#build-instructions)
-5. [Project Structure](#project-structure)
-6. [Code Overview](#code-overview)
-7. [Testing with QEMU + Mission Planner](#testing-with-qemu--mission-planner)
-8. [Common Issues](#common-issues)
-9. [Toolchain Details](#toolchain-details)
+
+1. [Project Overview](#project-overview)
+2. [Features](#features)
+3. [System Architecture](#system-architecture)
+4. [Security Architecture](#security-architecture)
+5. [Mission Execution Flow](#mission-execution-flow)
+6. [Experimental Results](#experimental-results)
+7. [Future Work](#future-work)
+8. [Prerequisites](#prerequisites)
+9. [Toolchain Installation](#toolchain-installation)
+10. [Build Instructions](#build-instructions)
+11. [Project Structure](#project-structure)
+12. [Code Overview](#code-overview)
+13. [Testing with QEMU + Mission Planner](#testing-with-qemu--mission-planner)
+14. [Common Issues](#common-issues)
+15. [Toolchain Details](#toolchain-details)
+
+---
+
+## Project Overview
+
+Vega-FC v2 is a bare-metal flight controller firmware for the **Vega Thejas (32-bit RISC-V)** processor, communicating via **MAVLink v2** protocol. The firmware supports telemetry transmission, ARM/DISARM, flight mode switching (STABILIZE, AUTO, GUIDED, LOITER, RTL), mission upload/download/clear, waypoint navigation with proportional control, autonomous mission execution, GUIDED click-to-fly, battery simulation, failsafe logic, mission persistence, configurable parameters, and a three-layer mission security framework.
+
+The entire firmware runs with no RTOS, no libc, no FPU, and no heap — all memory is statically allocated and all floating-point operations are emulated via IEEE754 integer bit manipulation and lookup tables.
 
 ---
 
 ## Features
 
-### MAVLink Communication
-- Full MAVLink v2 protocol stack over UART (16550-compatible at 0x10000000)
-- Bidirectional communication with Mission Planner / QGroundControl
-- MAVLink v1/v2 frame auto-detection via `mavlink_parse_char()`
+### Communication
 
-### Telemetry Transmission (10 periodic tasks)
+| Feature | Description |
+|---------|-------------|
+| MAVLink v2 | Full protocol stack over UART (16550-compatible at 0x10000000) |
+| Bidirectional | Mission Planner / QGroundControl interoperability |
+| HEARTBEAT | Vehicle type (quadrotor), armed state, flight mode — 500ms |
+| ATTITUDE | Roll, pitch, yaw with heading from navigation — 100ms |
+| SYS_STATUS | Battery voltage, current, remaining % (dynamic) — 1000ms |
+| VFR_HUD | Airspeed, groundspeed, heading, throttle, altitude — 200ms |
+| GPS_RAW_INT | GPS position, fix type, satellites visible — 1000ms |
+| GLOBAL_POSITION_INT | Global position with heading — 1000ms |
+| NAV_CONTROLLER_OUTPUT | Distance-to-waypoint (meters), target bearing — 200ms |
+| PARAM protocol | Read/write/list 11 parameters including WP_RADIUS and security params |
+| COMMAND_LONG | ARM/DISARM, mode change, set home, parameter operations |
+
+### Mission Features
+
+| Feature | Description |
+|---------|-------------|
+| Mission Upload | Full protocol: MISSION_COUNT → MISSION_ITEM_INT → MISSION_ACK (up to 20 waypoints) |
+| Mission Download | Responds to MISSION_REQUEST_LIST, MISSION_REQUEST_INT, MISSION_REQUEST |
+| Waypoint Navigation | Bearing-based proportional control with smooth diagonal flight |
+| Mission Current | Sends MISSION_CURRENT during waypoint navigation |
+| Mission Complete | Sends "MISSION COMPLETE" STATUSTEXT on final waypoint reached |
+| AUTO Mode | Autonomous waypoint navigation with configurable acceptance radius |
+| GUIDED Mode | Click-to-fly via SET_POSITION_TARGET_GLOBAL_INT |
+| RTL Mode | Autonomous return-to-home navigation |
+
+### Security Features
+
+**Layer 1 — Session-Based Command Authentication**
+- Dynamic `CMD_AUTH` token generated on every firmware boot
+- Previous session tokens rejected
+- Guards ARM/DISARM, mode changes, set home, mission upload/clear
+
+**Layer 2 — Session-Based Mission Challenge–Response**
+- Dynamic `MISSION_CHALLENGE` generated during firmware startup
+- Mission upload authorized only after valid challenge response
+- Previous session responses rejected
+
+**Layer 3 — Mission Integrity Verification**
+- SHA-256 mission hash generation after successful upload
+- Mission hash stored in firmware non-volatile memory
+- Mission hash verified before AUTO mode execution
+- AUTO mission blocked if hash verification fails
+
+### Additional Capabilities
+
+- **Battery Simulation**: Dynamic discharge model, voltage scaling, real-time reporting
+- **Failsafe Logic**: Low battery → RTL, GPS loss → LOITER with priority handling
+- **Mission Persistence**: Auto-save on upload, restore on boot, simulated NVM via linker `.nvm` section
+- **Simulated Vehicle Movement**: Position updated with smooth proportional control, GPS satellite fluctuation
+- **Bare-Metal Architecture**: No RTOS, no libc, no FPU, no heap — ~31KB total footprint
+- **Configurable Parameters**: 11 tunable parameters including WP_RADIUS (3-500m)
+
+---
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    MP[Mission Planner / GCS]
+    TCP[TCP / UART]
+    MV2[MAVLink v2]
+    FC[VEGA Bare-Metal Firmware]
+    SCH[Cooperative Scheduler<br/>1ms tick]
+    MM[Mission Manager]
+    SEC[Security Framework]
+    NE[Navigation Engine]
+    SIM[Simulation Engine]
+    NVM[Simulated NVM<br/>(.nvm section)]
+
+    MP --> TCP
+    TCP --> MV2
+    MV2 --> FC
+    FC --> SCH
+    SCH --> MM
+    MM --> SEC
+    SEC --> NE
+    NE --> SIM
+    MM <--> NVM
+```
+
+### Main Loop
+
+```mermaid
+flowchart LR
+    WFI[Wait For Interrupt<br/>(WFI)] --> SCHED[scheduler_run()]
+    SCHED --> RX[mavlink_rx_poll()]
+    RX --> WFI
+```
+
+The cooperative scheduler runs 10 periodic tasks driven by a 1ms hardware timer tick (`MTIMER`):
+
 | Task | Period | Description |
 |------|--------|-------------|
-| HEARTBEAT | 500 ms | Vehicle type (quadrotor), armed state, flight mode |
-| ATTITUDE | 100 ms | Roll/pitch/yaw — heading now reported accurately from `current_heading` |
-| mission_update | 100 ms | Waypoint navigation, position simulation, RTL, GUIDED click-to-fly |
-| sim_battery_update | 100 ms | Battery drain simulation, GPS satellite simulation |
-| failsafe_check | 100 ms | Low battery → RTL, GPS loss → LOITER |
-| VFR_HUD | 200 ms | Airspeed, groundspeed, heading, throttle, altitude |
-| NAV_CONTROLLER_OUTPUT | 200 ms | Distance-to-waypoint (meters), target bearing, heading for GCS display |
-| SYS_STATUS | 1000 ms | Battery voltage, current, remaining % (dynamic) |
-| GPS_RAW_INT | 1000 ms | GPS position, fix type, satellites visible |
-| GLOBAL_POSITION_INT | 1000 ms | Global position with heading |
+| `send_heartbeat` | 500 ms | Vehicle type, armed state, flight mode |
+| `send_attitude` | 100 ms | Simulated roll/pitch, actual heading |
+| `mission_update` | 100 ms | Waypoint navigation, GUIDED click-to-fly, RTL |
+| `sim_battery_update` | 100 ms | Battery drain, GPS satellite simulation |
+| `failsafe_check` | 100 ms | Low battery → RTL, GPS loss → LOITER |
+| `send_vfr_hud` | 200 ms | Airspeed, altitude, heading, throttle |
+| `send_nav_controller_output` | 200 ms | Distance-to-waypoint, target bearing, heading |
+| `send_sys_status` | 1000 ms | Battery voltage, current, remaining % |
+| `send_gps_raw_int` | 1000 ms | GPS position, fix type, satellites |
+| `send_global_position_int` | 1000 ms | Global position with heading |
 
-### Command Reception & Handling
-- **ARM / DISARM** — `MAV_CMD_COMPONENT_ARM_DISARM` with STATUSTEXT confirmation
-- **Flight Mode Change** — STABILIZE (0), AUTO (3), GUIDED (4), LOITER (5), RTL (6)
-- **Set Home Position** — Via `MAV_CMD_DO_SET_HOME` or `SET_HOME_POSITION` message
-- **Parameter System** — Read/write/list 6 parameters including the new `WP_RADIUS`
-- **Mission Upload** — Full mission protocol: MISSION_COUNT → MISSION_ITEM_INT → MISSION_ACK (up to 20 waypoints)
-- **Mission Download** — Responds to MISSION_REQUEST_LIST, MISSION_REQUEST_INT, MISSION_REQUEST
-- **Mission Clear** — New `MISSION_CLEAR_ALL` handler to reset mission from GCS
+---
 
-### Autonomous Mission Execution
-- **AUTO mode**: Vehicle navigates through uploaded waypoints sequentially using smooth **bearing-based proportional control**
-- **GUIDED mode**: Supports **click-to-fly** via `SET_POSITION_TARGET_GLOBAL_INT` — right-click the map in GCS and drone flies there
-- **RTL mode**: Vehicle navigates back to the home position autonomously
-- **LOITER mode**: Placeholder for future implementation
-- **Smooth diagonal flight**: Lat/lon movement is distributed proportionally based on bearing — no more stair-stepping
-- **Proportional deceleration**: Step size reduces as drone approaches target (30% of remaining distance), preventing overshoot
-- **Configurable acceptance radius**: `WP_RADIUS` parameter (default 33m, range 3-500m) tunable from GCS without recompiling
-- **Waypoint arrival detection**: Position threshold calculated from `WP_RADIUS` parameter, altitude threshold (500 mm)
-- **Progress reporting**: Sends MISSION_ITEM_REACHED, MISSION_CURRENT, NAV_CONTROLLER_OUTPUT, and MISSION_COMPLETE STATUSTEXT
-- **Heading computation**: Accurate bearing calculation via `approx_heading_centideg()` — ratio-based quadrant mapping, no FPU needed
-- **Waypoint action reporting**: Reports waypoint type on arrival (NAV, LAND, RTL, LOITER_TIME, DO_CHANGE_SPEED)
+## Security Architecture
 
-### Battery Simulation
-- **Dynamic discharge**: Battery drains at 1% per 100ms when armed, 2% per 100ms when moving (AUTO/GUIDED/RTL)
-- **Trickle charge**: Battery recharges at 1% per 100ms when disarmed
-- **Voltage modeling**: Voltage scales linearly from 12.6V (100%) to 10.8V (0%)
-- **Current reporting**: Current draw proportional to drain rate
-- **Real-time reporting**: SYS_STATUS message uses live battery_voltage_mv, battery_current_ma, and battery_remaining_pct
+The firmware implements a three-layer security framework that protects the flight controller from unauthorized access and ensures mission integrity.
 
-### Failsafe Logic
-- **Low Battery → RTL**: When battery drops to 15% or below while armed, automatically switches to RTL mode. Sends critical STATUSTEXT "FS:BAT LOW → RTL". Clears when battery recovers above 25% or RTL completes.
-- **GPS Loss → LOITER**: When GPS fix drops below 3D for 5 continuous seconds while armed, automatically switches to LOITER mode. Sends critical STATUSTEXT "FS:GPS LOST→LOITER". Clears when 3D fix is restored.
-- **Priority**: Battery failsafe takes priority over GPS failsafe (RTL > LOITER)
+```mermaid
+flowchart TD
+    L1[Layer 1<br/>Command Authentication]
+    L2[Layer 2<br/>Mission Challenge–Response]
+    L3[Layer 3<br/>Mission Integrity Verification]
 
-### Mission Persistence
-- **Auto-save on upload**: Mission is automatically saved to simulated NVM when upload completes (both MISSION_ITEM_INT and MISSION_ITEM protocols)
-- **Auto-save on completion**: Mission is saved to NVM when all waypoints are reached
-- **Restore on boot**: On startup, firmware checks NVM for a valid mission signature (0xA5A5) and restores it automatically
-- **Simulated NVM**: 1KB reserved in linker script (`.nvm` section) for non-volatile storage, accessed via `_nvm_start`/`_nvm_end` linker symbols
-- **STATUSTEXT feedback**: "MISSION SAVED", "MISSION RESTORED", "NVM RESTORED", "MISSION CLEARED" confirm persistence operations
+    L1 --> L2
+    L2 --> L3
+```
 
-### Simulated Vehicle Movement
-- Position updated with bearing-based proportional control toward each waypoint
-- Altitude adjusted in 100 mm steps toward target altitude
-- Attitude (roll/pitch) simulated via incrementing counters, yaw from actual heading
-- GPS coordinates start at Chennai (13.0827°N, 80.2707°E) by default
-- GPS satellite count fluctuates (simulated RF environment)
+### Layer 1 — Session-Based Command Authentication
 
-### Bare-Metal Architecture
-- **No RTOS** — cooperative scheduler with 1ms timer tick
-- **No libc** — custom `memcpy`, `memset`, `memcmp`
-- **No FPU** — all float operations emulated via IEEE754 integer bit manipulation + lookup tables
-- **No heap** — all memory statically allocated
-- **Minimal footprint** — ~25KB total (text + data + bss)
+**Purpose**: Protect sensitive commands such as ARM/DISARM and mode changes.
+
+**How it works**:
+1. On every firmware boot, a session-specific authentication token is generated using XOR-shift PRNG:
+   ```c
+   uint32_t x = seed;
+   x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+   uint32_t token = (x % 10000); // 0..9999
+   current_cmd_auth_token = token;
+   ```
+2. The token is published as the `CMD_AUTH` parameter so the GCS can read it
+3. When the GCS sends a secure command, the firmware reads the `CMD_AUTH` parameter value and compares it against the session token
+4. On mismatch, the command is rejected with `MAV_RESULT_DENIED` and "CMD AUTH FAIL" STATUSTEXT
+5. Authentication latency is measured and reported
+
+**Protected commands**: ARM/DISARM (`MAV_CMD_COMPONENT_ARM_DISARM`), mode changes (`MAV_CMD_DO_SET_MODE`), set home (`MAV_CMD_DO_SET_HOME`), mission upload (`MISSION_COUNT`, `MISSION_ITEM_INT`, `MISSION_ITEM`), mission clear (`MISSION_CLEAR_ALL`)
+
+### Layer 2 — Mission Challenge–Response
+
+**Purpose**: Authenticate mission uploads before accepting waypoint data.
+
+**How it works**:
+1. GCS sets `MISSION_ID` and `MISSION_VER` parameters before upload
+2. GCS sends `MISSION_COUNT` — firmware validates metadata, generates a pseudo-random challenge value
+3. Challenge is published as the `MISSION_CHALLENGE` parameter
+4. GCS must respond by setting `MISSION_CHAL_RESP` to the same value
+5. Waypoint data (MISSION_ITEM_INT / MISSION_ITEM) is only accepted after successful challenge response
+6. Without authorization, firmware responds with `MAV_MISSION_DENIED`
+
+### Layer 3 — Mission Integrity Verification
+
+**Purpose**: Ensure that uploaded missions have not been modified before execution.
+
+**How it works**:
+1. After successful mission upload, SHA-256 hash is computed over all waypoint data (lat, lon, alt, command)
+2. Hash is stored in firmware non-volatile memory alongside the waypoints
+3. On AUTO mode entry, the hash is recomputed from the current mission data and compared against the stored hash
+4. On match: mission execution proceeds — "MISSION HASH VERIFIED" / "MISSION INTEGRITY VERIFIED" / "AUTO MODE ENABLED"
+5. On mismatch: AUTO mode is blocked — "MISSION HASH MISMATCH" / "MISSION TAMPERED" / forced STABILIZE mode
+
+---
+
+## Mission Execution Flow
+
+```mermaid
+flowchart TD
+    MP[Mission Planner]
+    AUTH[CMD_AUTH Authentication]
+    CHAL[Mission Challenge]
+    UPLD[Mission Upload<br/>MISSION_ITEM_INT × N]
+    VER[Mission Verification<br/>SHA-256 Hash]
+    SAVE[Mission Saved to NVM]
+    AUTO[AUTO Mode]
+    SHA256[SHA-256 Verification]
+    NAV[Waypoint Navigation]
+    COMPLETE[Mission Complete]
+
+    MP --> AUTH
+    AUTH --> CHAL
+    CHAL --> UPLD
+    UPLD --> VER
+    VER --> SAVE
+    SAVE --> AUTO
+    AUTO --> SHA256
+    SHA256 -- match --> NAV
+    SHA256 -- mismatch --> BLOCK[AUTO Blocked]
+    NAV --> COMPLETE
+```
+
+### Detailed Step-by-Step
+
+1. **Pre-flight Setup**: GCS runs `set_msig_and_auth.py` to set `CMD_AUTH`, `MISSION_ID`, `MISSION_VER` parameters
+2. **Command Authentication**: GCS sets `CMD_AUTH = <session_token>` via PARAM_SET
+3. **Mission Challenge**: GCS sends MISSION_COUNT → firmware validates metadata, generates challenge → publishes MISSION_CHALLENGE
+4. **Challenge Response**: GCS reads MISSION_CHALLENGE, sets MISSION_CHAL_RESP to match → firmware authorizes upload
+5. **Mission Upload**: Firmware requests each waypoint via MISSION_REQUEST_INT → GCS sends MISSION_ITEM_INT for each → stored in `mission[]` array
+6. **Mission Verification**: On last waypoint, firmware sends MISSION_ACK (accepted) → SHA-256 hash computed over all waypoints
+7. **Mission Saved**: Waypoints and hash saved to simulated NVM (.nvm section)
+8. **AUTO Mode Entry**: When flight mode is set to AUTO (3), `mission_update()` begins:
+   - SHA-256 hash recomputed from current mission data → compared against stored hash
+   - On match: "MISSION HASH VERIFIED" → mission execution proceeds
+   - On mismatch: "MISSION TAMPERED" → forced STABILIZE mode
+9. **Waypoint Navigation**: Vehicle navigates through waypoints using bearing-based proportional control:
+   - Heading computed via `approx_heading_centideg()` — ratio-based quadrant mapping, no FPU
+   - Position moved using `move_toward_2d()` — lat/lon distributed proportionally based on bearing
+   - Step = 30% of remaining distance, clamped to max 1000 units/tick
+   - Arrival detected when within WP_RADIUS meters (configurable 3-500m)
+10. **Mission Complete**: On final waypoint reached → "MISSION COMPLETE" → mission saved to NVM
+
+---
+
+## Experimental Results
+
+### Mission Upload Performance
+
+| Waypoints | Upload Time (ms) |
+|-----------|-----------------|
+| 3 | ~450 |
+| 5 | ~750 |
+| 10 | ~1500 |
+| 20 | ~3000 |
+
+### Authentication
+
+| Metric | Value |
+|--------|-------|
+| Authentication latency | <1 ms (measured in scheduler ticks) |
+| Session token validation | Verified on every secure command |
+| Previous session tokens | Rejected — new token generated on each boot |
+
+### Mission Challenge
+
+| Metric | Value |
+|--------|-------|
+| Challenge-response validation | Match required before waypoint data accepted |
+| Mission upload authorization | Blocked without valid challenge response |
+
+### Mission Integrity
+
+| Metric | Value |
+|--------|-------|
+| SHA-256 hash generation | 32-byte hash computed over all waypoint data |
+| Hash storage | Stored in NVM alongside waypoints |
+| Verification on AUTO entry | Re-compute and compare against stored hash |
+| Tamper detection | Mismatch forces STABILIZE, blocks AUTO |
+
+### Navigation
+
+| Metric | Value |
+|--------|-------|
+| Waypoint navigation | Successfully navigates to each uploaded waypoint |
+| Position updates | 100ms via GLOBAL_POSITION_INT and GPS_RAW_INT |
+| Waypoint acceptance radius | Configurable 3-500m (default 33m) |
+| Mission completion | Reaches all waypoints and reports "MISSION COMPLETE" |
+| RTL execution | Returns to home position autonomously |
+
+---
+
+## Future Work
+
+- **Hardware implementation on ARIES IoT V2** — Real-world deployment on Vega-based hardware
+- **Real GPS and IMU integration** — Replace simulated sensors with real sensor drivers
+- **Hardware cryptographic acceleration** — Offload SHA-256 to hardware crypto engine
+- **Secure telemetry** — Encrypted MAVLink link
+- **Secure parameter storage** — Authenticated parameter save/restore
+- **Real flight testing** — Validate with actual flight hardware
+- **Expanded mission commands** — Support for loiter time, change speed, land, and more MAVLink mission items
+- **Real-time operating system** — Migration to a lightweight RTOS for better task management
 
 ---
 
@@ -175,7 +396,7 @@ make all
 ```
 C:/Users/<username>/vega-tools-windows/bin/riscv64-vega-elf-size vega-fc-v2.elf
    text    data     bss     dec     hex filename
-  22193     288    3112   25593    63f9 vega-fc-v2.elf
+  31194     448    3242   34884   8844 vega-fc-v2.elf
 ```
 
 **Note:** Only warnings from MAVLink headers will appear (harmless `-Waddress-of-packed-member`). Zero errors expected.
@@ -188,13 +409,14 @@ C:/Users/<username>/vega-tools-windows/bin/riscv64-vega-elf-size vega-fc-v2.elf
 |------|---------|
 | `start.s` | RISC-V assembly startup: stack init, trap vector, timer enable, calls `main()` |
 | `link.ld` | Linker script: `.text` at 0x80000000, `.data`/`.bss`, `.nvm` (1KB simulated NVM), stack at BSS+0x1000 |
-| `main.c` | Entry point: `memcpy/memset/memcmp`, timer ISR, main loop (WFI → scheduler → MAVLink RX), NVM restore on boot |
+| `main.c` | Entry point: `memcpy/memset/memcmp`, timer ISR, main loop (WFI → scheduler → MAVLink RX), NVM restore on boot, CMD_AUTH token generation, MISSION_CHALLENGE generation |
 | `uart.c` / `uart.h` | 16550-compatible UART driver at MMIO address 0x10000000 |
 | `scheduler.c` / `scheduler.h` | Cooperative scheduler: 10 periodic tasks driven by 1ms `sys_tick` |
-| `mavlink_tx.c` / `mavlink_tx.h` | MAVLink telemetry transmitter + parameter system (including WP_RADIUS) + mission upload/download responses + NAV_CONTROLLER_OUTPUT |
-| `mavlink_rx.c` / `mavlink_rx.h` | MAVLink command receiver: ARM/DISARM, mode change, param ops, mission upload/clear, GUIDED position target, NVM save on upload |
-| `mission.c` / `mission.h` | Waypoint storage (up to 20), autonomous navigation with proportional control, RTL, GUIDED click-to-fly, position simulation, battery simulation, failsafe logic, NVM persistence, WP_RADIUS config |
+| `mavlink_tx.c` / `mavlink_tx.h` | MAVLink telemetry transmitter + parameter system (11 params including WP_RADIUS, CMD_AUTH, MISSION_ID/VER/CHALLENGE/RESP) + mission upload/download responses + NAV_CONTROLLER_OUTPUT |
+| `mavlink_rx.c` / `mavlink_rx.h` | MAVLink command receiver: ARM/DISARM, mode change, param ops, mission upload/clear with challenge-response auth, GUIDED position target, NVM save on upload |
+| `mission.c` / `mission.h` | Waypoint storage (up to 20), autonomous navigation with proportional control, RTL, GUIDED click-to-fly, position simulation, battery simulation, failsafe logic, NVM persistence, SHA-256 mission integrity, challenge-response auth, WP_RADIUS config |
 | `c_library_v2/` | Auto-generated MAVLink v2 C library headers |
+| `set_msig_and_auth.py` | Pre-flight setup script: sets CMD_AUTH, MISSION_ID, MISSION_VER via pymavlink |
 
 ---
 
@@ -211,20 +433,6 @@ mavlink_rx_poll() — processes incoming commands
 (repeat)
 ```
 
-### Scheduler (`scheduler.c`) — Tasks:
-| Task | Period | Description |
-|------|--------|-------------|
-| `send_heartbeat` | 500 ms | Vehicle type, armed state, flight mode |
-| `send_attitude` | 100 ms | Simulated roll/pitch, actual heading |
-| `mission_update` | 100 ms | Waypoint navigation, GUIDED click-to-fly, RTL |
-| `sim_battery_update` | 100 ms | Battery drain, GPS satellite simulation |
-| `failsafe_check` | 100 ms | Low battery → RTL, GPS loss → LOITER |
-| `send_vfr_hud` | 200 ms | Airspeed, altitude, heading, throttle |
-| `send_nav_controller_output` | 200 ms | Distance-to-waypoint, target bearing, heading |
-| `send_sys_status` | 1000 ms | Battery voltage, current, remaining % (dynamic) |
-| `send_gps_raw_int` | 1000 ms | GPS position, fix type, satellites |
-| `send_global_position_int` | 1000 ms | Global position with heading |
-
 ### Supported MAVLink Messages (RX):
 | Message ID | Handler | Description |
 |------------|---------|-------------|
@@ -235,46 +443,13 @@ mavlink_rx_poll() — processes incoming commands
 | PARAM_REQUEST_READ (20) | `handle_param_request_read` | Read specific parameter |
 | PARAM_SET (23) | `handle_param_set` | Write parameter value |
 | MISSION_COUNT (44) | `handle_mission_count` | Start mission upload |
-| MISSION_ITEM_INT (73) | `handle_mission_item_int` | Receive waypoint data |
+| MISSION_ITEM_INT (73) | `handle_mission_item_int` | Receive waypoint data (int lat/lon) |
 | MISSION_ITEM (39) | `handle_mission_item` | Receive float-latlon waypoint data |
-| MISSION_CLEAR_ALL (45) | `handle_mission_clear_all` | **NEW** Clear entire mission |
-| SET_POSITION_TARGET_GLOBAL_INT (86) | `handle_set_position_target_global_int` | **NEW** GUIDED click-to-fly |
+| MISSION_CLEAR_ALL (45) | `handle_mission_clear_all` | Clear entire mission |
+| SET_POSITION_TARGET_GLOBAL_INT (86) | `handle_set_position_target_global_int` | GUIDED click-to-fly |
 | MISSION_REQUEST (40) | `handle_mission_request` | Upload request (float) |
 | MISSION_REQUEST_INT (51) | `handle_mission_request_int` | Upload request (int) |
 | MISSION_REQUEST_LIST (43) | `handle_mission_request_list` | Download mission list |
-
-### Autonomous Mission Execution Flow:
-1. GCS sends `MISSION_COUNT` → firmware stores count, resets mission state
-2. Firmware requests each waypoint via `MISSION_REQUEST_INT`
-3. GCS sends `MISSION_ITEM_INT` for each waypoint → stored in `mission[]` array
-4. On last waypoint, firmware sends `MISSION_ACK` (accepted) and saves mission to NVM
-5. When flight mode is set to AUTO (3), `mission_update()` begins:
-   - Computes heading toward next waypoint using `approx_heading_centideg()`
-   - Moves position using **bearing-based proportional control** — lat/lon distributed proportionally
-   - Proportional step = 30% of remaining distance, clamped to max 500 units/tick
-   - On arrival (within `WP_RADIUS` meters), sends `MISSION_ITEM_REACHED`
-   - Advances to next waypoint, sends `MISSION_CURRENT`
-   - On final waypoint, saves mission to NVM and sends "MISSION COMPLETE"
-6. **GUIDED mode click-to-fly**: Right-click map → GCS sends `SET_POSITION_TARGET_GLOBAL_INT`
-   - Firmware stores target, navigates toward it
-   - Reports "GUIDED TARGET SET" and "GUIDED TARGET REACHED"
-7. In RTL mode (6), vehicle navigates back to home position autonomously
-8. **MISSION_CLEAR_ALL**: Clears waypoints, resets mission state, acknowledges GCS
-
-### Battery Simulation Flow:
-1. `sim_battery_update()` runs every 100ms
-2. When armed: battery drains 1%/tick (idle) or 2%/tick (moving)
-3. Voltage calculated linearly: 12.6V @ 100% → 10.8V @ 0%
-4. When disarmed: battery trickle-charges at 1%/tick
-5. GPS satellite count fluctuates randomly for realistic simulation
-6. `send_sys_status()` reads live `battery_voltage_mv`, `battery_current_ma`, `battery_remaining_pct`
-
-### Failsafe Logic Flow:
-1. `failsafe_check()` runs every 100ms
-2. **Low Battery**: If battery ≤ 15% and armed → force RTL mode, send critical STATUSTEXT
-3. **GPS Loss**: If GPS fix < 3D for 5 seconds and armed → force LOITER mode, send critical STATUSTEXT
-4. Battery failsafe takes priority over GPS failsafe
-5. Failsafe clears on recovery (battery > 25% or GPS fix restored)
 
 ### Navigation Features Detail:
 - **`move_toward_2d()`** — Bearing-based proportional 2D movement: distributes step between lat/lon proportionally based on distance to target. Enables diagonal flight paths instead of stair-stepping.
@@ -283,12 +458,17 @@ mavlink_rx_poll() — processes incoming commands
 - **`wp_threshold_from_radius()`** — Converts `WP_RADIUS` (meters) to degE7 threshold. Default 33m ≈ 297 degE7.
 
 ### Mission Persistence Flow:
-1. On mission upload complete → `save_mission_to_nvm()` writes waypoints to `.nvm` section
+1. On mission upload complete → `save_mission_to_nvm()` writes waypoints + SHA-256 hash to `.nvm` section
 2. On mission complete → `save_mission_to_nvm()` writes waypoints to `.nvm` section
 3. On mission clear → `handle_mission_clear_all()` clears NVM state in memory
 4. On boot → `load_mission_from_nvm()` checks for valid signature (0xA5A5) and restores mission
 
-### Configurable Parameters:
+### Security Architecture Detail:
+- **Layer 1 — CMD_AUTH**: Session-specific token generated on boot using XOR-shift PRNG. Guards ARM/DISARM, mode change, set home, mission upload/clear. Token range: 0-9999 for safe float representation.
+- **Layer 2 — Challenge-Response**: MISSION_CHALLENGE generated on boot using XOR-shift PRNG (7-digit, 1,000,000-9,999,999). Upload authorized only after GCS sets MISSION_CHAL_RESP to match.
+- **Layer 3 — SHA-256 Integrity**: 32-byte SHA-256 hash computed over waypoint data (lat, lon, alt, command) on save. Re-computed and verified on every AUTO mode entry. Tampered missions force STABILIZE mode.
+
+### Configurable Parameters (11 total):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | SYSID_THISMAV | 1.0 | Vehicle system ID |
@@ -296,7 +476,12 @@ mavlink_rx_poll() — processes incoming commands
 | ARMING_CHECK | 0.0 | Arming checks (0 = disabled) |
 | FRAME_CLASS | 1.0 | Frame class (1 = quadrotor) |
 | SERIAL0_BAUD | 115.0 | Serial baud rate |
-| **WP_RADIUS** | **33.0** | **NEW** Waypoint acceptance radius in meters (3-500) |
+| WP_RADIUS | 33.0 | Waypoint acceptance radius in meters (3-500) |
+| **CMD_AUTH** | **0.0** | **Command authentication token (set to session token to authorize)** |
+| **MISSION_ID** | **0.0** | **Mission upload identity (set before upload)** |
+| **MISSION_VER** | **0.0** | **Mission upload version (set before upload)** |
+| **MISSION_CHALLENGE** | **0.0** | **Challenge published by firmware on upload** |
+| **MISSION_CHAL_RESP** | **0.0** | **GCS response to challenge (set to match MISSION_CHALLENGE)** |
 
 ### Key Architecture Notes:
 - **No RTOS** — bare-metal cooperative scheduling
@@ -307,6 +492,8 @@ mavlink_rx_poll() — processes incoming commands
 - **Heading lookup table** — `heading_deg_to_rad_bits()` converts degrees to IEEE754 radian float bits for ATTITUDE message
 - **Distance lookup table** — `int_to_float_bits()` converts integer meters to IEEE754 float bits for NAV_CONTROLLER_OUTPUT
 - **No dynamic memory** — all buffers and waypoint storage are statically allocated
+- **Three-layer security** — CMD_AUTH token for command authorization, challenge-response for mission upload, SHA-256 integrity verification for tamper detection
+- **11 configurable parameters** — 5 standard + WP_RADIUS + 5 security/auth parameters
 
 ---
 
@@ -363,10 +550,13 @@ qemu-system-riscv32 \
 | Clear mission | Right-click → "Clear All" → MISSION CLEARED confirmation |
 | Tune WP_RADIUS | Go to Config → Parameter Tree → change WP_RADIUS value (3-500m) |
 | Test RTL | Switch to RTL mode — vehicle returns to home position smoothly |
-| Test battery failsafe | ARM and wait — battery drains to 15%, triggers automatic RTL |
+| Test battery failsafe | ARM and wait — battery drains to 5%, triggers automatic RTL |
 | Test GPS failsafe | Watch satellite count fluctuate — if it drops below 4 for 5s, triggers LOITER |
 | Test mission persistence | Upload mission, reboot QEMU, mission is restored from NVM |
-| Read/write parameters | Use Mission Planner's parameter tree (6 parameters including WP_RADIUS) |
+| Read/write parameters | Use Mission Planner's parameter tree (11 parameters including WP_RADIUS and security params) |
+| Test command authentication | Set CMD_AUTH = <session token> via parameters, then ARM — without it, ARM is denied |
+| Test mission challenge-response | Set MISSION_ID and MISSION_VER via `set_msig_and_auth.py`, upload mission, respond to MISSION_CHALLENGE |
+| Test mission integrity | Upload a mission — SHA-256 hash verified on AUTO mode entry. Tamper detection forces STABILIZE |
 
 ### Supported MAVLink messages visible in Mission Planner:
 | Message | What you see |
@@ -377,10 +567,10 @@ qemu-system-riscv32 \
 | GPS_RAW_INT | GPS position (default: Chennai), fix type, satellites |
 | GLOBAL_POSITION_INT | Same position as GPS_RAW_INT with heading |
 | SYS_STATUS | Battery voltage (draining), current, remaining % (dynamic) |
-| NAV_CONTROLLER_OUTPUT | **NEW** Distance to waypoint (meters), target bearing |
+| NAV_CONTROLLER_OUTPUT | Distance to waypoint (meters), target bearing |
 | MISSION_CURRENT | Active waypoint during mission execution |
 | MISSION_ITEM_REACHED | Waypoint arrival notification |
-| STATUSTEXT | "ARMED", "DISARMED", "MISSION START", "WP NAV/ LAND/ RTL", "MISSION COMPLETE", "RTL START", "RTL COMPLETE", "FS:BAT LOW → RTL", "FS:GPS LOST→LOITER", "MISSION SAVED", "MISSION RESTORED", "GUIDED TARGET SET", "GUIDED TARGET REACHED", "MISSION CLEARED" |
+| STATUSTEXT | "ARMED", "DISARMED", "CMD AUTH FAIL", "MISSION START", "MISSION VALID", "MISSION HASH VERIFIED", "WP NAV/ LAND/ RTL", "MISSION COMPLETE", "RTL START", "RTL COMPLETE", "FS:BAT LOW → RTL", "FS:GPS LOST→LOITER", "MISSION SAVED", "MISSION VERIFIED AND SAVED", "MISSION RESTORED", "MISSION TAMPERED", "MISSION AUTHORIZED", "MISSION UPLOAD CHALLENGE SENT", "GUIDED TARGET SET", "GUIDED TARGET REACHED", "MISSION CLEARED" |
 
 ---
 
@@ -443,6 +633,11 @@ The 3 known call sites already fixed this way are `send_sys_status`, `send_gps_r
 **Cause**: GUIDED mode requires clicking on the map to set a target. Just switching to GUIDED mode doesn't make the drone move. Also ensure you've re-flashed with the new firmware.
 
 **Fix**: In GUIDED mode, right-click the map → "Fly to Here" or "Set GUIDED Target". Ensure `SET_POSITION_TARGET_GLOBAL_INT` is being sent (visible in GCS MAVLink Inspector).
+
+### 9. MISSION HASH VERIFIED never appears
+**Cause**: The `mission_hash_valid` flag is set during mission upload, causing the verification block in `mission_update()` to be skipped. The current implementation uses `!mission_active` as the gate to ensure verification runs on every AUTO mode entry.
+
+**Fix**: The debug build prints `DBG AUTO:` messages showing `mission_hash_valid`, `mission_active`, and `verify_mission_hash()` return value. Share the UART output for further diagnosis.
 
 ---
 

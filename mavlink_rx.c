@@ -4,6 +4,41 @@
 #include "uart.h"
 #include "scheduler.h"
 
+/* ── mission upload timing ── */
+uint32_t upload_start_time = 0;
+uint32_t upload_end_time = 0;
+
+static void print_auth_result(uint8_t allowed)
+{
+    uint32_t received = (uint32_t)get_param_value(PARAM_CMD_AUTH);
+
+    uart_print("\n");
+    uart_print("CMD_AUTH RECEIVED : ");
+    uart_print_int(received);
+    uart_print("\n\n");
+
+    if (allowed) {
+        uart_print("AUTHENTICATION SUCCESS\n\n");
+    } else {
+        uart_print("EXPECTED TOKEN : ");
+        uart_print_int(current_cmd_auth_token);
+        uart_print("\n\n");
+        uart_print("AUTHENTICATION FAILED\n\n");
+    }
+
+    uart_print("Authentication Latency : ");
+    uart_print_int(auth_latency);
+    uart_print(" ms\n\n");
+    uart_print("-------------------------------------\n\n");
+}
+
+static void debug_uart_message(const char *label, uint32_t value)
+{
+    uart_print(label);
+    uart_print_int(value);
+    uart_putchar('\n');
+}
+
 static mavlink_message_t rx_msg;
 static mavlink_status_t  rx_status;
 
@@ -74,6 +109,13 @@ static void handle_command_long(const mavlink_message_t *msg)
 
     if (cmd.command == MAV_CMD_COMPONENT_ARM_DISARM) {
         if (param1.u == 0x3F800000UL) {
+            uint8_t auth_ok = secure_command_allowed();
+            print_auth_result(auth_ok);
+            if (!auth_ok) {
+                send_command_ack(cmd.command, MAV_RESULT_DENIED);
+                send_statustext(MAV_SEVERITY_WARNING, "CMD AUTH FAIL");
+                return;
+            }
             armed_state = 1;
             send_statustext(MAV_SEVERITY_INFO, "ARMED");
         }
@@ -87,7 +129,17 @@ static void handle_command_long(const mavlink_message_t *msg)
         send_command_ack(cmd.command, MAV_RESULT_ACCEPTED);
     }
     else if (cmd.command == MAV_CMD_DO_SET_MODE) {
-        set_flight_mode(command_param_to_mode(param2.u));
+        uint32_t requested_mode = command_param_to_mode(param2.u);
+        if ((requested_mode == 3 || requested_mode == 4 || requested_mode == 6)) {
+            uint8_t auth_ok = secure_command_allowed();
+            print_auth_result(auth_ok);
+            if (!auth_ok) {
+                send_command_ack(cmd.command, MAV_RESULT_DENIED);
+                send_statustext(MAV_SEVERITY_WARNING, "CMD AUTH FAIL");
+                return;
+            }
+        }
+        set_flight_mode(requested_mode);
         send_command_ack(cmd.command, MAV_RESULT_ACCEPTED);
     }
     else if (cmd.command == MAV_CMD_REQUEST_MESSAGE) {
@@ -96,6 +148,13 @@ static void handle_command_long(const mavlink_message_t *msg)
             send_home_position();
     }
     else if (cmd.command == MAV_CMD_DO_SET_HOME) {
+        uint8_t auth_ok = secure_command_allowed();
+        print_auth_result(auth_ok);
+        if (!auth_ok) {
+            send_command_ack(cmd.command, MAV_RESULT_DENIED);
+            send_statustext(MAV_SEVERITY_WARNING, "CMD AUTH FAIL");
+            return;
+        }
         float q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
         if (param1.u == 0x3F800000UL) {
             update_home_position(130827000, 802707000, 10000,
@@ -187,6 +246,19 @@ static void handle_param_set(const mavlink_message_t *msg)
     if (index >= 0) {
         set_param_value((uint16_t)index, req.param_value);
         send_param_value((uint16_t)index);
+
+        if (index == PARAM_MISSION_CHAL_RESP) {
+            uint32_t raw_val = (uint32_t)req.param_value;
+            debug_uart_message("DBG CHAL_RESP=", raw_val);
+            if (mission_submit_upload_response(req.param_value)) {
+                debug_uart_message("DBG AUTH FLG=", mission_upload_authorized());
+                send_statustext(MAV_SEVERITY_INFO, "MISSION chal response OK");
+                send_mission_request_int_to(mission_rx_idx, msg->sysid, msg->compid);
+            } else {
+                debug_uart_message("DBG AUTH FLG=", mission_upload_authorized());
+                send_statustext(MAV_SEVERITY_WARNING, "MISSION chal response BAD");
+            }
+        }
     }
 }
 
@@ -196,22 +268,38 @@ static void handle_mission_count(const mavlink_message_t *msg)
 
     mavlink_msg_mission_count_decode(msg, &count);
 
-    mission_count = count.count;
-    if (mission_count > MAX_WAYPOINTS)
-        mission_count = MAX_WAYPOINTS;
+    uint8_t mc_auth = secure_command_allowed();
+    print_auth_result(mc_auth);
+    if (!mc_auth) {
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION AUTH FAIL");
+        return;
+    }
 
-    mission_reset();
+    if (count.count > MAX_WAYPOINTS) {
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION COUNT TOO LARGE");
+        return;
+    }
+
+    if (!mission_begin_upload(count.count)) {
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION METADATA MISSING");
+        return;
+    }
+
+    /* start mission upload timer */
+    upload_start_time = sys_tick;
+
+    debug_uart_message("DBG MCOUNT=", count.count);
+    debug_uart_message("DBG AUTH FLG=", mission_upload_authorized());
     send_statustext(MAV_SEVERITY_INFO, "MISSION_COUNT RXD");
 
-    mission_rx_idx = 0;
-
-    if (mission_count > 0)
-    {
+    if (mission_count > 0) {
+        /* require challenge response before accepting mission items */
+        send_statustext(MAV_SEVERITY_INFO, "MISSION UPLOAD CHALLENGE SENT");
         send_mission_request_int_to(0, msg->sysid, msg->compid);
-        send_statustext(MAV_SEVERITY_INFO, "REQ_SENT");
-    }
-    else
-    {
+    } else {
         send_mission_ack_to(MAV_MISSION_ACCEPTED, msg->sysid, msg->compid);
     }
 }
@@ -220,6 +308,21 @@ static void handle_mission_item_int(const mavlink_message_t *msg)
 {
     mavlink_mission_item_int_t item;
     union { float f; uint32_t u; } alt;
+
+    uint8_t mii_auth = secure_command_allowed();
+    print_auth_result(mii_auth);
+    if (!mii_auth) {
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION AUTH FAIL");
+        return;
+    }
+
+    if (!mission_upload_authorized()) {
+        debug_uart_message("DBG AUTH FLG=", mission_upload_authorized());
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION UPLOAD UNAUTHORIZED");
+        return;
+    }
 
     mavlink_msg_mission_item_int_decode(msg, &item);
     alt.f = item.z;
@@ -238,8 +341,15 @@ static void handle_mission_item_int(const mavlink_message_t *msg)
     if (mission_rx_idx < mission_count)
         send_mission_request_int_to(mission_rx_idx, msg->sysid, msg->compid);
     else {
+        send_statustext(MAV_SEVERITY_INFO, "MISSION VERIFIED");
         send_mission_ack_to(MAV_MISSION_ACCEPTED, msg->sysid, msg->compid);
         save_mission_to_nvm();   /* persist uploaded mission */
+        /* stop timer and print upload time */
+        upload_end_time = sys_tick;
+        uart_print("MISSION UPLOAD COMPLETE\n");
+        uart_print("Mission Upload Time : ");
+        uart_print_int(upload_end_time - upload_start_time);
+        uart_print(" ms\n");
     }
 }
 
@@ -248,6 +358,21 @@ static void handle_mission_item(const mavlink_message_t *msg)
 {
     mavlink_mission_item_t item;
     union { float f; uint32_t u; } alt;
+
+    uint8_t mi_auth = secure_command_allowed();
+    print_auth_result(mi_auth);
+    if (!mi_auth) {
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION AUTH FAIL");
+        return;
+    }
+
+    if (!mission_upload_authorized()) {
+        debug_uart_message("DBG AUTH FLG=", mission_upload_authorized());
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION UPLOAD UNAUTHORIZED");
+        return;
+    }
 
     mavlink_msg_mission_item_decode(msg, &item);
     alt.f = item.z;
@@ -267,8 +392,15 @@ static void handle_mission_item(const mavlink_message_t *msg)
     if (mission_rx_idx < mission_count)
         send_mission_request_int_to(mission_rx_idx, msg->sysid, msg->compid);
     else {
+        send_statustext(MAV_SEVERITY_INFO, "MISSION VERIFIED");
         send_mission_ack_to(MAV_MISSION_ACCEPTED, msg->sysid, msg->compid);
         save_mission_to_nvm();   /* persist uploaded mission */
+        /* stop timer and print upload time */
+        upload_end_time = sys_tick;
+        uart_print("MISSION UPLOAD COMPLETE\n");
+        uart_print("Mission Upload Time : ");
+        uart_print_int(upload_end_time - upload_start_time);
+        uart_print(" ms\n");
     }
 }
 
@@ -300,6 +432,14 @@ static void handle_mission_clear_all(const mavlink_message_t *msg)
 {
     mavlink_mission_clear_all_t clear;
     mavlink_msg_mission_clear_all_decode(msg, &clear);
+
+    uint8_t clr_auth = secure_command_allowed();
+    print_auth_result(clr_auth);
+    if (!clr_auth) {
+        send_mission_ack_to(MAV_MISSION_DENIED, msg->sysid, msg->compid);
+        send_statustext(MAV_SEVERITY_WARNING, "MISSION AUTH FAIL");
+        return;
+    }
 
     if (clear.target_system == 1 || clear.target_system == 0) {
         mission_reset();

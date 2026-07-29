@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define MAX_WAYPOINTS 20
+#define MISSION_HASH_SIZE 32   /* SHA-256 hash size in bytes */
 
 /* ── waypoint ── */
 typedef struct {
@@ -18,6 +19,9 @@ extern uint16_t   mission_count;
 extern uint16_t   mission_rx_idx;
 extern uint8_t    mission_loaded;
 extern uint16_t   current_waypoint_idx;
+extern uint32_t   current_mission_id;
+extern uint32_t   current_mission_ver;
+extern uint32_t   current_mission_challenge;
 
 /* ── position ── */
 extern int32_t  current_lat;
@@ -50,10 +54,15 @@ typedef struct {
     uint16_t signature;
     uint16_t count;
     waypoint_t waypoints[MAX_WAYPOINTS];
+    uint8_t  hash[MISSION_HASH_SIZE];  /* SHA-256 hash of waypoint data for integrity check */
+    uint32_t mission_id;
+    uint32_t mission_ver;
+    uint32_t mission_challenge;
 } nvm_mission_t;
 
 /* ── externally settable parameters ── */
 extern uint32_t wp_radius_m;            /* waypoint acceptance radius in meters */
+extern uint8_t  mission_hash_valid;     /* 1 = mission integrity verified */
 
 /* ── GUIDED mode target (set by RX handler) ── */
 extern int32_t  guided_target_lat;
@@ -64,6 +73,9 @@ extern uint8_t  guided_target_set;
 /* ── functions ── */
 void mission_update(void);
 void mission_reset(void);
+uint8_t mission_begin_upload(uint16_t count);
+uint8_t mission_submit_upload_response(float response);
+uint8_t mission_upload_authorized(void);
 void sim_battery_update(void);
 void failsafe_check(void);
 void save_mission_to_nvm(void);

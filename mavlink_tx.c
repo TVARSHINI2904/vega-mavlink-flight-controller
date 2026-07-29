@@ -1,4 +1,5 @@
 #include "mavlink_tx.h"
+#include "scheduler.h"
 #include "uart.h"
 #include "mission.h"
 
@@ -6,7 +7,7 @@ uint8_t armed_state = 0;
 uint32_t custom_mode = 0;  /* 0=STABILIZE, 3=AUTO, 4=GUIDED, 5=LOITER, 6=RTL */
 int32_t home_lat = 130827000;
 int32_t home_lon = 802707000;
-int32_t home_alt = 10000;
+int32_t home_alt = 100000;
 static float   home_x = 0.0f;
 static float   home_y = 0.0f;
 static float   home_z = 0.0f;
@@ -28,9 +29,22 @@ static param_entry_t params[] = {
     {"FRAME_CLASS", 1.0f, MAV_PARAM_TYPE_REAL32},
     {"SERIAL0_BAUD", 115.0f, MAV_PARAM_TYPE_REAL32},
     {"WP_RADIUS", 33.0f, MAV_PARAM_TYPE_REAL32},   /* waypoint acceptance radius (m) */
+    {"CMD_AUTH", 0.0f, MAV_PARAM_TYPE_REAL32},    /* secure command auth token */
+    {"MISSION_ID", 0.0f, MAV_PARAM_TYPE_REAL32},
+    {"MISSION_VER", 0.0f, MAV_PARAM_TYPE_REAL32},
+    {"MISSION_CHALLENGE", 0.0f, MAV_PARAM_TYPE_REAL32},
+    {"MISSION_CHAL_RESP", 0.0f, MAV_PARAM_TYPE_REAL32},
 };
 
 #define PARAM_COUNT ((uint16_t)(sizeof(params) / sizeof(params[0])))
+#define PARAM_WP_RADIUS 5
+#define PARAM_CMD_AUTH   6
+#define PARAM_MISSION_ID 7
+#define PARAM_MISSION_VER 8
+#define PARAM_MISSION_CHALLENGE 9
+#define PARAM_MISSION_CHAL_RESP 10
+/* session-specific command auth token (regenerated on each boot) */
+uint32_t current_cmd_auth_token = 0;
 
 static uint8_t heartbeat_base_mode(void)
 {
@@ -67,6 +81,9 @@ static const char *mode_name(uint32_t mode)
 
 void set_flight_mode(uint32_t mode)
 {
+    if (mode == 3 && custom_mode != 3) {
+        uart_print("AUTO MODE REQUEST\n");
+    }
     custom_mode = mode;
     send_statustext(MAV_SEVERITY_INFO, mode_name(mode));
 }
@@ -383,6 +400,30 @@ int16_t find_param_index(const char *param_id)
     return -1;
 }
 
+/* ── CMD_AUTH authentication timing (visible to RX for printing) ── */
+uint32_t auth_start_time = 0;
+uint32_t auth_end_time = 0;
+uint32_t auth_latency = 0;
+
+uint8_t secure_command_allowed(void)
+{
+    auth_start_time = sys_tick;
+    /* compare received CMD_AUTH parameter (float) cast to uint32_t
+       against the session-specific token */
+    uint32_t received = (uint32_t)params[PARAM_CMD_AUTH].value;
+    uint8_t result = (received == current_cmd_auth_token) ? 1 : 0;
+    auth_end_time = sys_tick;
+    auth_latency = auth_end_time - auth_start_time;
+    return result;
+}
+
+float get_param_value(uint16_t index)
+{
+    if (index >= PARAM_COUNT)
+        return 0.0f;
+    return params[index].value;
+}
+
 void set_param_value(uint16_t index, float value)
 {
     if (index >= PARAM_COUNT)
@@ -391,8 +432,7 @@ void set_param_value(uint16_t index, float value)
     params[index].value = value;
 
     /* sync WP_RADIUS parameter to mission's wp_radius_m variable */
-    /* WP_RADIUS is at index 5 */
-    if (index == 5) {
+    if (index == PARAM_WP_RADIUS) {
         wp_radius_m = (uint32_t)value;
         if (wp_radius_m < 3) wp_radius_m = 3;
         if (wp_radius_m > 500) wp_radius_m = 500;
@@ -553,22 +593,25 @@ void send_mission_item_int_to(uint16_t seq, uint8_t target_sys, uint8_t target_c
 /* converts integer meters (0..10000) to IEEE754 float bits */
 static uint32_t int_to_float_bits(uint32_t val)
 {
-    /* LUT for integer → float bits for 0..100 with 5m resolution */
-    /* This covers all distances our simulated mission will produce */
-    if (val == 0)      return 0x00000000;  /* 0.0f   */
-    if (val <= 5)      return 0x40A00000;  /* 5.0f   */
-    if (val <= 10)     return 0x41200000;  /* 10.0f  */
-    if (val <= 20)     return 0x41A00000;  /* 20.0f  */
-    if (val <= 30)     return 0x41F00000;  /* 30.0f  */
-    if (val <= 50)     return 0x42480000;  /* 50.0f  */
-    if (val <= 75)     return 0x42960000;  /* 75.0f  */
-    if (val <= 100)    return 0x42C80000;  /* 100.0f */
-    if (val <= 150)    return 0x43160000;  /* 150.0f */
-    if (val <= 200)    return 0x43480000;  /* 200.0f */
-    if (val <= 300)    return 0x43960000;  /* 300.0f */
-    if (val <= 500)    return 0x43FA0000;  /* 500.0f */
-    if (val <= 1000)   return 0x447A0000;  /* 1000.0f*/
-    return 0x44FA0000;                     /* 2000.0f*/
+    /* LUT for integer → float bits for 0..10000m */
+    if (val == 0)      return 0x00000000;  /* 0.0f    */
+    if (val <= 5)      return 0x40A00000;  /* 5.0f    */
+    if (val <= 10)     return 0x41200000;  /* 10.0f   */
+    if (val <= 20)     return 0x41A00000;  /* 20.0f   */
+    if (val <= 30)     return 0x41F00000;  /* 30.0f   */
+    if (val <= 50)     return 0x42480000;  /* 50.0f   */
+    if (val <= 75)     return 0x42960000;  /* 75.0f   */
+    if (val <= 100)    return 0x42C80000;  /* 100.0f  */
+    if (val <= 150)    return 0x43160000;  /* 150.0f  */
+    if (val <= 200)    return 0x43480000;  /* 200.0f  */
+    if (val <= 300)    return 0x43960000;  /* 300.0f  */
+    if (val <= 500)    return 0x43FA0000;  /* 500.0f  */
+    if (val <= 1000)   return 0x447A0000;  /* 1000.0f */
+    if (val <= 2000)   return 0x44FA0000;  /* 2000.0f */
+    if (val <= 3000)   return 0x453B8000;  /* 3000.0f */
+    if (val <= 5000)   return 0x459C4000;  /* 5000.0f */
+    if (val <= 8000)   return 0x45FA0000;  /* 8000.0f */
+    return 0x461C4000;                     /* 10000.0f*/
 }
 
 /* ── NAV_CONTROLLER_OUTPUT ── */
